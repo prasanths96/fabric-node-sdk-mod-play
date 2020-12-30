@@ -8,7 +8,7 @@ import { Gateway, GatewayOptions, X509Identity } from '/home/osboxes/github.com/
 import * as path from 'path';
 import { buildCCPOrg1, buildWallet, prettyJSONString } from './utils//AppUtil';
 import { buildCAClient, enrollAdmin, registerAndEnrollUser } from './utils/CAUtil';
-import { Client, User, Proposal, BuildProposalRequest, IdentityContext } from '/home/osboxes/github.com/prasanths96/fabric-sdk-node/fabric-common'
+import { Client, User, Proposal, BuildProposalRequest, IdentityContext, Endorsement, EndorsementResponse } from '/home/osboxes/github.com/prasanths96/fabric-sdk-node/fabric-common'
 
 // import CryptoJS from 'crypto-js';
 // import * as elliptic from 'elliptic';
@@ -199,7 +199,8 @@ async function main() {
             // console.log(`*** Result: ${prettyJSONString(result.toString())}`);
 
             // let result = await contract.evaluateTransaction(signFunc, 'ReadAsset', 'asset1');
-            const signedEnvelope = await invokeClient(signFunc, cert, 'ReadAsset', 'asset1')
+            const signedEnvelope = await proposalGenerator(signFunc, cert, 'ReadAsset', 'asset1')
+            // const signedEnvelope = await proposalGenerator(signFunc, cert, 'TransferAsset', 'asset1', 'Pras3')
             user = User.createUser(signedEnvelope.extra.userOpts.name, signedEnvelope.extra.userOpts.pass, signedEnvelope.extra.userOpts.mspid, signedEnvelope.extra.userOpts.signedCertPEM)
             // const identity2 = user.getIdentity()
             const identity2 = {
@@ -212,6 +213,8 @@ async function main() {
                     // dummy priv key / admin priv key
                     // It is using the priv key for discovery service dammit
                     privateKey: "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgc34g+Qf2q5ofmBX3\nt5JrwLubbafO4FvwkleNrP1mvzuhRANCAAQh1CvrMqS83iSzmiLF9NxQvXqi7YX6\nfXzOYWyBlQ9Rv9crOZngie8wtUAwl4FjRWafasrxM2/ML6vkbntebFEi\n-----END PRIVATE KEY-----\n",
+                    // @ts-ignore
+                    // privateKey: identity.credentials.privateKey,
                 }
             }
             
@@ -231,10 +234,22 @@ async function main() {
             // Get the contract from the network.
             const contract2 = network2.getContract(chaincodeName);
 
-            let result = await contract2.evaluateTransaction2(signedEnvelope.proposal_bytes, signedEnvelope.signature, 'ReadAsset', 'asset1');
+            let result = await contract2.evaluateBySignedEnvelope(signedEnvelope.proposal_bytes, signedEnvelope.signature);
             console.log("Result:")
             console.log(result.toString())
-        
+
+            // // INVOKE!!!!! WEEEEEE
+            // // STEP 1!!!
+            // let result = await contract2.endorseBySignedEnvelope(signedEnvelope.proposal_bytes, signedEnvelope.signature);
+            // console.log("Endorse Result:")
+            // let resultJSON = JSON.parse(result.toString())
+            // console.log(resultJSON)
+
+            // // STEP 2!!!!!!
+            // const signedEnvelope2 = await commitGenerator(signFunc, cert, signedEnvelope.extra._action, result)
+            // let result2 = await contract2.commitBySignedEnvelope(signedEnvelope2.commit_bytes, signedEnvelope2.signature, signedEnvelope.extra._txId);
+            // console.log("Commit Result:")
+            // console.log(result2)
         } finally {
             // Disconnect from the gateway when the application is closing
             // This will close all connections to the network
@@ -315,7 +330,87 @@ function _preventMalleability(sig: any) {
 3. Gets response with transaction to be signed
 4. Signs and sends it back to Orderer Submition
 */
-async function invokeClient(sign: {(msg: string) : Promise<Buffer>}, cert: string, funcName: string,...args: string[]) {
+async function commitGenerator(sign: {(msg: string) : Promise<Buffer>}, cert: string, action: object, endorseResponse: Buffer) {
+    // Parse the endorseResponse
+    let endorsementResponses: EndorsementResponse[] = JSON.parse(endorseResponse.toString())
+    // Parse Buffers inside json object 
+    for ( let i = 0; i < endorsementResponses.length; i ++){
+        // @ts-ignore
+        endorsementResponses[i] = parseJSONBuffers(endorsementResponses[i])
+    }
+
+    // Client
+    const client = new Client('new client')
+    // Channel
+    const channel = client.newChannel(channelName)
+    // Endorsement
+    const endorsement = new Endorsement(chaincodeName, channel)
+    endorsement.setAction(action)
+
+    endorsement.setProposalResponses(endorsementResponses)
+
+    console.log("Check endorsements:")
+    console.log(JSON.stringify(endorsementResponses[0].endorsement))
+    
+    const commit = endorsement.newCommit();
+    // User
+    const userOpts = {
+        name: org1UserId,
+        pass:'',
+        mspid: mspOrg1,
+        signedCertPEM: cert,
+    }
+    const user = User.createUser(userOpts.name, userOpts.pass, userOpts.mspid, userOpts.signedCertPEM)
+    // IdentityContext
+    const idx = client.newIdentityContext(user)
+    const identityContext = idx.calculateTransactionId();
+
+    
+    // Building commit
+    const commitBytes = commit.build(identityContext);
+    const digest = computeHash(commitBytes)
+    // console.log("Commit id: ", commit.getTransactionId())
+    // Sign it
+    const signatureBytes = await sign(digest)
+
+    const signedEnvelope = {
+        signature: signatureBytes,
+        commit_bytes: commitBytes,
+        extra: {
+            userOpts
+        }
+    };
+
+    return signedEnvelope
+
+}
+
+function parseJSONBuffers(jsonObj: Object) : Object {
+    Object.keys(jsonObj).forEach(function(key) {
+        // @ts-ignore
+        let val = jsonObj[key];
+        let valType = typeof val;
+        if (val && valType === 'object') {
+            // Recurse through fields
+            val = parseJSONBuffers(val)
+
+            // Parse buffer
+            if (val.type && val.type === 'Buffer' && val.data) {
+                // @ts-ignore
+                jsonObj[key] = Buffer.from(val.data)
+            }
+        }
+    });
+
+    return jsonObj
+}
+
+
+async function invokeOrchestrator() {
+    
+}
+
+async function proposalGenerator(sign: {(msg: string) : Promise<Buffer>}, cert: string, funcName: string,...args: string[]) {
     // Client
     const client = new Client('new client')
     // Channel
@@ -338,28 +433,31 @@ async function invokeClient(sign: {(msg: string) : Promise<Buffer>}, cert: strin
     // Building proposal
     verifyTransactionName(funcName); 
     const qualifiedName = _getQualifiedName(funcName);
-    const buildProposalRequest = newBuildProposalRequest(qualifiedName, args)
+    const buildProposalRequest = newBuildProposalRequest(qualifiedName, args);
 
-    const proposalBytes = proposal.build(identityContext, buildProposalRequest)
-    const digest = computeHash(proposalBytes)
-
+    const proposalBytes = proposal.build(identityContext, buildProposalRequest);
+    const digest = computeHash(proposalBytes);
+    console.log("Proposal id:", proposal.getTransactionId())
     // Sign it
-    const signatureBytes = await sign(digest)
+    const signatureBytes = await sign(digest);
 
     // const signedProposal = fabproto6.protos.SignedProposal.create({
     //     signature: signatureBytes,
     //     proposal_bytes: proposalBytes
     // });
-
+    const _action = proposal.getAction();
+    const _txId = proposal.getTransactionId();
     const signedEnvelope = {
         signature: signatureBytes,
         proposal_bytes: proposalBytes,
         extra: {
+            _txId: _txId,
+            _action: _action,
             userOpts
         }
     };
 
-    return signedEnvelope
+    return signedEnvelope;
 
 }
 
